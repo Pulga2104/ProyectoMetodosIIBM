@@ -1,12 +1,22 @@
 import matplotlib.pyplot as plt
-from matplotlib.widgets import RectangleSelector, RadioButtons
+from matplotlib.widgets import RectangleSelector, RadioButtons, Button, TextBox
 import rasterio
+from rasterio.mask import mask as rasterio_mask
 import numpy as np
 from stl import mesh
 from scipy.ndimage import uniform_filter, median_filter
 import os
 import datetime
 import sys
+import json
+try:
+    import geopandas as gpd
+    from shapely.geometry import mapping
+    TIENE_GEOPANDAS = True
+except ImportError:
+    TIENE_GEOPANDAS = False
+    print("AVISO: Instala 'geopandas' para usar polígonos reales de provincias.")
+    print("  pip install geopandas")
 
 # Importación del módulo personalizado de procesamiento
 from src.procesador import verificar_o_crear_mapa
@@ -17,6 +27,7 @@ from src.procesador import verificar_o_crear_mapa
 CARPETA_DATOS = "datos_srtm"      
 ARCHIVO_FINAL = "ecuador_completo.tif"
 CARPETA_STL = "modelos_stl"
+ARCHIVO_PROVINCIAS = "gadm41_ECU_1.json"  # GeoJSON con polígonos de provincias
 
 # Verificación de la existencia o generación del mapa de elevación
 print("--- INICIANDO SISTEMA ---")
@@ -67,6 +78,239 @@ def suavizado_mediana(matriz):
         numpy.ndarray: Matriz filtrada mediante mediana
     """
     return median_filter(matriz, size=3)
+
+# ==========================================
+# GESTIÓN DE PROVINCIAS
+# ==========================================
+
+def cargar_provincias():
+    """
+    Carga el archivo GeoJSON con los polígonos de provincias de Ecuador.
+    
+    Returns:
+        GeoDataFrame: GeoDataFrame con provincias y sus geometrías (polígonos)
+    """
+    if not os.path.exists(ARCHIVO_PROVINCIAS):
+        print(f"AVISO: Archivo '{ARCHIVO_PROVINCIAS}' no encontrado.")
+        print("Descarga GADM level1 para Ecuador desde: https://gadm.org/download_country.html")
+        return None
+    
+    if not TIENE_GEOPANDAS:
+        print("ERROR: Se requiere geopandas para cargar provincias.")
+        print("Instala con: pip install geopandas")
+        return None
+    
+    try:
+        # Cargar GeoJSON con geopandas
+        gdf = gpd.read_file(ARCHIVO_PROVINCIAS)
+        
+        # El campo de nombre de provincia puede ser 'NAME_1' o similar en GADM
+        if 'NAME_1' in gdf.columns:
+            gdf = gdf.rename(columns={'NAME_1': 'provincia'})
+        elif 'NOMBRE' in gdf.columns:
+            gdf = gdf.rename(columns={'NOMBRE': 'provincia'})
+        
+        # Excluir Galápagos (no está en el mapa de elevación)
+        gdf = gdf[~gdf['provincia'].str.contains('Galápagos|Galapagos', case=False, na=False)]
+        
+        print(f"✓ Provincias cargadas: {len(gdf)} encontradas (sin Galápagos).")
+        print(f"  Provincias: {', '.join(sorted(gdf['provincia'].unique()))}")
+        return gdf
+    
+    except Exception as e:
+        print(f"Error cargando provincias: {e}")
+        return None
+
+def generar_stl_provincia(provincia_nombre, provincias_gdf, metodo='Promedio', guardar_preview=True):
+    """
+    Genera un modelo STL para una provincia específica de Ecuador.
+    
+    Args:
+        provincia_nombre (str): Nombre de la provincia
+        provincias_gdf (GeoDataFrame): GeoDataFrame con geometrías de provincias
+        metodo (str): Método de suavizado ('Promedio' o 'Mediana')
+        guardar_preview (bool): Si True, guarda una imagen de verificación del recorte
+    """
+    # Buscar la provincia (case-insensitive)
+    prov_row = provincias_gdf[provincias_gdf['provincia'].str.lower() == provincia_nombre.lower()]
+    
+    if prov_row.empty:
+        print(f"Provincia '{provincia_nombre}' no encontrada.")
+        return
+    
+    ahora = datetime.datetime.now()
+    timestamp = ahora.strftime("%H-%M-%S")
+    print(f"\n[{timestamp}] Procesando provincia: {provincia_nombre}")
+    
+    try:
+        with rasterio.open(ARCHIVO_FINAL) as src:
+            # Asegurar que la geometría esté en el mismo CRS que el raster
+            if prov_row.crs != src.crs:
+                prov_row_reproj = prov_row.to_crs(src.crs)
+                geom = prov_row_reproj.geometry.values[0]
+            else:
+                geom = prov_row.geometry.values[0]
+            
+            # Recortar raster usando el polígono de la provincia
+            out_image, out_transform = rasterio_mask(src, [mapping(geom)], crop=True, nodata=-32768)
+            matriz = out_image[0]
+            
+            # Validación de tamaño mínimo de selección
+            if matriz.size < 100:
+                print(f"  ⚠ Área muy pequeña para {provincia_nombre}.")
+                return
+            
+            # VERIFICACIÓN VISUAL: Guardar imagen del recorte con contorno
+            if guardar_preview:
+                carpeta_preview = "verificacion_provincias"
+                if not os.path.exists(carpeta_preview):
+                    os.makedirs(carpeta_preview)
+                
+                fig_verify, ax_verify = plt.subplots(figsize=(10, 8))
+                
+                # Mostrar matriz de elevación
+                data_preview = matriz.copy().astype(float)
+                data_preview[data_preview < -1000] = np.nan
+                
+                im = ax_verify.imshow(data_preview, cmap='terrain', interpolation='bilinear')
+                plt.colorbar(im, ax=ax_verify, label='Elevación (m)')
+                
+                # Dibujar contorno de la provincia sobre el recorte
+                from rasterio.plot import plotting_extent
+                extent_crop = plotting_extent(out_image[0], out_transform)
+                
+                # Convertir geometría a coordenadas de imagen
+                if geom.geom_type == 'Polygon':
+                    x, y = geom.exterior.xy
+                    # Transformar coordenadas geográficas a índices de píxeles
+                    from affine import Affine
+                    inv_transform = ~out_transform
+                    xs, ys = [], []
+                    for xi, yi in zip(x, y):
+                        col, row = inv_transform * (xi, yi)
+                        xs.append(col)
+                        ys.append(row)
+                    ax_verify.plot(xs, ys, 'r-', linewidth=2, label='Límite provincial')
+                elif geom.geom_type == 'MultiPolygon':
+                    for poly in geom.geoms:
+                        x, y = poly.exterior.xy
+                        inv_transform = ~out_transform
+                        xs, ys = [], []
+                        for xi, yi in zip(x, y):
+                            col, row = inv_transform * (xi, yi)
+                            xs.append(col)
+                            ys.append(row)
+                        ax_verify.plot(xs, ys, 'r-', linewidth=2)
+                
+                ax_verify.set_title(f'VERIFICACIÓN: {provincia_nombre}\n'
+                                   f'Área: {matriz.shape[0]}x{matriz.shape[1]} píxeles\n'
+                                   f'Elevación: {np.nanmin(data_preview):.0f}m - {np.nanmax(data_preview):.0f}m',
+                                   fontsize=12, fontweight='bold')
+                ax_verify.set_xlabel('Columnas (píxeles)')
+                ax_verify.set_ylabel('Filas (píxeles)')
+                ax_verify.legend()
+                ax_verify.grid(True, alpha=0.3)
+                
+                # Guardar imagen de verificación
+                nombre_limpio = provincia_nombre.replace(' ', '_').replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u').replace('ñ', 'n')
+                preview_filename = os.path.join(carpeta_preview, f"Verificacion_{nombre_limpio}_{timestamp}.png")
+                plt.savefig(preview_filename, dpi=150, bbox_inches='tight')
+                plt.close(fig_verify)
+                print(f"  ✓ Verificación guardada: {preview_filename}")
+            
+            # Limpieza de datos
+            matriz = matriz.astype(float)
+            matriz[matriz < -1000] = np.nan
+            matriz = np.nan_to_num(matriz, nan=np.nanmin(matriz))
+            
+            # Aplicar suavizado
+            if 'Promedio' in metodo:
+                matriz_suave = suavizado_promedio(matriz)
+                matriz_suave = suavizado_promedio(matriz_suave)
+                matriz_suave = suavizado_promedio(matriz_suave)
+                etiqueta = "Promedio"
+            else:
+                matriz_suave = suavizado_mediana(matriz)
+                matriz_suave = suavizado_mediana(matriz_suave)
+                etiqueta = "Mediana"
+            
+            # Generar nombre de archivo sin caracteres especiales
+            nombre_limpio = provincia_nombre.replace(' ', '_').replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u').replace('ñ', 'n')
+            nombre_archivo = f"Modelo_{nombre_limpio}_{etiqueta}_{timestamp}.stl"
+            
+            # Generar STL
+            generar_stl(matriz_suave, nombre_archivo, metodo)
+            print(f"  ✓ Modelo de {provincia_nombre} generado exitosamente.")
+            
+    except Exception as e:
+        print(f"  ✗ Error generando modelo para {provincia_nombre}: {e}")
+
+def generar_todas_provincias(provincias_gdf, metodo='Promedio'):
+    """
+    Genera modelos STL para todas las provincias de Ecuador.
+    
+    Args:
+        provincias_gdf (GeoDataFrame): GeoDataFrame con información de provincias
+        metodo (str): Método de suavizado a aplicar
+    """
+    if provincias_gdf is None:
+        print("No hay datos de provincias cargados.")
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"GENERANDO MODELOS PARA TODAS LAS PROVINCIAS DE ECUADOR")
+    print(f"Método de suavizado: {metodo}")
+    print(f"Total de provincias: {len(provincias_gdf)}")
+    print(f"{'='*70}\n")
+    
+    total = len(provincias_gdf)
+    for idx, (_, row) in enumerate(provincias_gdf.iterrows(), 1):
+        provincia = row['provincia']
+        print(f"[{idx}/{total}] Procesando: {provincia}...")
+        generar_stl_provincia(provincia, provincias_gdf, metodo)
+    
+    print(f"\n{'='*70}")
+    print("✓ PROCESO COMPLETADO - Todos los modelos generados")
+    print(f"{'='*70}\n")
+
+def dibujar_limites_provincias(ax, provincias_gdf):
+    """
+    Dibuja los límites reales de todas las provincias en el mapa.
+    
+    Args:
+        ax: Eje de matplotlib donde dibujar
+        provincias_gdf (GeoDataFrame): GeoDataFrame con geometrías de provincias
+    """
+    if provincias_gdf is None:
+        return
+    
+    # Reproyectar si es necesario (al CRS del raster que está en EPSG:4326)
+    try:
+        with rasterio.open(ARCHIVO_FINAL) as src:
+            if provincias_gdf.crs != src.crs:
+                provincias_gdf = provincias_gdf.to_crs(src.crs)
+    except Exception as e:
+        print(f"Advertencia al verificar CRS: {e}")
+    
+    for _, row in provincias_gdf.iterrows():
+        nombre = row['provincia']
+        geom = row['geometry']
+        
+        # Dibujar el polígono real de la provincia
+        if geom.geom_type == 'Polygon':
+            x, y = geom.exterior.xy
+            ax.plot(x, y, color='#FF5722', linewidth=1.5, alpha=0.7, linestyle='-')
+        elif geom.geom_type == 'MultiPolygon':
+            for poly in geom.geoms:
+                x, y = poly.exterior.xy
+                ax.plot(x, y, color='#FF5722', linewidth=1.5, alpha=0.7, linestyle='-')
+        
+        # Agregar nombre de provincia en el centroide
+        centroid = geom.centroid
+        ax.text(centroid.x, centroid.y, nombre, 
+                fontsize=7, ha='center', va='center',
+                color='#D32F2F', fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='#FF5722', linewidth=1))
 
 # ==========================================
 # GENERACIÓN DE MODELOS STL
@@ -372,6 +616,9 @@ def al_seleccionar(eclick, erelease):
 # ==========================================
 print("Cargando interfaz...")
 
+# Cargar provincias
+provincias_dict = cargar_provincias()
+
 try:
     with rasterio.open(ARCHIVO_FINAL) as src:
         src_global = src
@@ -386,10 +633,10 @@ try:
 
     # Configuración de la figura con estilo mejorado
     plt.style.use('seaborn-v0_8-darkgrid')
-    fig = plt.figure(figsize=(14, 10), facecolor='#F5F5F5')
+    fig = plt.figure(figsize=(16, 10), facecolor='#F5F5F5')
     
-    # Ajuste de márgenes para mejor distribución
-    ax = plt.axes([0.08, 0.1, 0.70, 0.85])
+    # Ajuste de márgenes para mejor distribución (más espacio para controles)
+    ax = plt.axes([0.05, 0.1, 0.60, 0.85])
     ax_global = ax
     
     # Aplicar estilo al área de trazado
@@ -424,10 +671,14 @@ try:
         data[data < -1000] = np.nan
         ax.imshow(data, cmap='terrain', extent=extent, aspect='auto', interpolation='bilinear')
 
+    # Dibujar límites de provincias - DESACTIVADO
+    # if provincias_dict is not None:
+    #     dibujar_limites_provincias(ax, provincias_dict)
+
     # Configuración de título y etiquetas con estilo profesional
     ax.set_title(
-        "MAPA INTERACTIVO 3D - Generador de Modelos Topográficos\n"
-        "Usa la rueda del ratón para hacer zoom. Dibuja un rectángulo para seleccionar el área a exportar.", 
+        "MAPA INTERACTIVO 3D - Generador de Modelos Topográficos de Ecuador\n"
+        "MODO 1: Dibuja un rectángulo | MODO 2: Genera por provincia (ver panel derecho)", 
         fontsize=13, 
         fontweight='bold',
         color='#1976D2',
@@ -439,11 +690,13 @@ try:
     # Mejorar apariencia de los ticks
     ax.tick_params(colors='#424242', labelsize=10)
 
-    # Creación del panel de controles con diseño mejorado
-    ejes_botones = plt.axes([0.80, 0.40, 0.18, 0.25], facecolor='#FAFAFA')
+    # ===== PANEL DE CONTROLES =====
+    
+    # 1. Algoritmo de suavizado
+    ejes_botones = plt.axes([0.67, 0.70, 0.30, 0.20], facecolor='#FAFAFA')
     ejes_botones.set_title(
         'Algoritmo de Suavizado', 
-        fontsize=11, 
+        fontsize=10, 
         fontweight='bold', 
         color='#1976D2',
         pad=10
@@ -458,27 +711,95 @@ try:
     
     # Estilizar los labels de los radio buttons
     for label in radio.labels:
-        label.set_fontsize(10)
+        label.set_fontsize(9)
         label.set_color('#424242')
 
+    # 2. Botones de provincias
+    if provincias_dict is not None:
+        # Botón para generar todas las provincias
+        btn_todas_ax = plt.axes([0.67, 0.60, 0.30, 0.05])
+        btn_todas = Button(btn_todas_ax, 'GENERAR TODAS LAS PROVINCIAS', 
+                          color='#4CAF50', hovercolor='#45A049')
+        
+        def generar_todas_callback(event):
+            metodo = radio.value_selected
+            print("\n" + "="*70)
+            print("INICIANDO GENERACIÓN MASIVA DE PROVINCIAS")
+            print("="*70)
+            generar_todas_provincias(provincias_dict, metodo)
+        
+        btn_todas.on_clicked(generar_todas_callback)
+        
+        # Lista de provincias para selección individual
+        provincias_lista = sorted(provincias_dict['provincia'].unique())
+        
+        # Crear área de scroll para provincias (simulado con texto)
+        info_prov_ax = plt.axes([0.67, 0.25, 0.30, 0.30], facecolor='#FFF3E0')
+        info_prov_ax.axis('off')
+        
+        provincias_texto = "PROVINCIAS DISPONIBLES:\n" + "─"*35 + "\n"
+        for i, prov in enumerate(provincias_lista, 1):
+            provincias_texto += f"{i:2d}. {prov}\n"
+        
+        info_prov_ax.text(
+            0.05, 0.98, provincias_texto,
+            ha='left', va='top',
+            fontsize=7,
+            color='#E65100',
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='#FF9800', linewidth=1)
+        )
+        
+        # Campo de texto para ingresar número de provincia
+        txt_provincia_ax = plt.axes([0.67, 0.18, 0.20, 0.04])
+        txt_provincia = TextBox(txt_provincia_ax, 'N° Provincia:', initial='')
+        
+        # Botón para generar provincia individual desde interfaz
+        btn_individual_ax = plt.axes([0.67, 0.13, 0.30, 0.04])
+        btn_individual = Button(btn_individual_ax, 'Generar Provincia por Número', 
+                               color='#2196F3', hovercolor='#1976D2')
+        
+        def generar_individual_callback(event):
+            metodo = radio.value_selected
+            numero_texto = txt_provincia.text.strip()
+            
+            if not numero_texto:
+                print("\n⚠ Por favor ingresa un número de provincia en el campo de texto.")
+                return
+            
+            try:
+                numero = int(numero_texto)
+                if 1 <= numero <= len(provincias_lista):
+                    provincia_seleccionada = provincias_lista[numero - 1]
+                    print(f"\n{'='*70}")
+                    print(f"GENERANDO MODELO PARA: {provincia_seleccionada} (#{numero})")
+                    print(f"{'='*70}")
+                    generar_stl_provincia(provincia_seleccionada, provincias_dict, metodo)
+                    
+                    # Limpiar el campo de texto
+                    txt_provincia.set_val('')
+                else:
+                    print(f"\n⚠ Número inválido. Debe estar entre 1 y {len(provincias_lista)}")
+            except ValueError:
+                print(f"\n⚠ '{numero_texto}' no es un número válido. Ingresa un número del 1 al {len(provincias_lista)}")
+        
+        btn_individual.on_clicked(generar_individual_callback)
+    
     # Agregar cuadro de información
-    info_ax = plt.axes([0.80, 0.15, 0.18, 0.20], facecolor='#E3F2FD')
+    info_ax = plt.axes([0.67, 0.02, 0.30, 0.10], facecolor='#E3F2FD')
     info_ax.axis('off')
     info_text = (
-        "INSTRUCCIONES:\n\n"
-        "1. Haz zoom con la rueda\n"
-        "2. Selecciona un algoritmo\n"
-        "3. Dibuja un rectángulo\n"
-        "   sobre el área deseada\n"
-        "4. El modelo STL se\n"
-        "   guardará automáticamente"
+        "MODO MANUAL:\n"
+        "1. Selecciona algoritmo\n"
+        "2. Dibuja rectángulo en el mapa\n"
+        "3. STL se guarda automáticamente"
     )
     info_ax.text(
         0.5, 0.5, info_text,
         ha='center', va='center',
-        fontsize=9,
+        fontsize=8,
         color='#1565C0',
-        bbox=dict(boxstyle='round,pad=0.8', facecolor='white', edgecolor='#1976D2', linewidth=2)
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='#1976D2', linewidth=2)
     )
 
     # Conexión de eventos de interacción del usuario
@@ -494,8 +815,18 @@ try:
         props=dict(facecolor='#1976D2', alpha=0.3, edgecolor='#0D47A1', linewidth=2)
     )
     
-    print("Interfaz lista. Los archivos STL se guardarán en la carpeta 'modelos_stl'.")
-    print("Haz zoom para ver más detalles en el mapa de calles.")
+    print("\n" + "="*70)
+    print("✓ INTERFAZ LISTA")
+    print("="*70)
+    if provincias_dict is not None:
+        print(f"✓ {len(provincias_dict)} provincias cargadas y visualizadas en el mapa")
+        print("  - Usa 'GENERAR TODAS LAS PROVINCIAS' para procesamiento masivo")
+        print("  - O dibuja un rectángulo para selección manual")
+    else:
+        print("  - Dibuja un rectángulo para selección manual")
+    print("  - Los archivos STL se guardarán en 'modelos_stl/'")
+    print("  - Usa la rueda del ratón para hacer zoom")
+    print("="*70 + "\n")
     plt.show()
 
 except Exception as e:
