@@ -4,6 +4,16 @@ Este proyecto requiere ciertas dependencias y datos para funcionar correctamente
 
 ## Provisión de Datos (Importante)
 
+**Uso de datos del repositorio**
+
+Para comprimir los archivos de gran tamaño (.hgt , .slt) se utilizo Git LFS.
+
+Para ello primero debe de instalar LFS con la linea de comando: **git lfs install**
+
+Despuesa de instalar LFS, al clonar el repositorio los archivos originales se descargaran del Github, 
+
+Si es que ya tiene el repositorio de manera local y conectado remotamente al repositorio, debe de utlizar el comando: **git lfs pull**, para descargar los archivos comprimidos del repositorio.
+
 **El sistema necesita datos de elevación del terreno para generar los modelos.**
 
 1.  Descarga los datos SRTM de tu área de interés (archivos `.hgt`).
@@ -35,3 +45,4 @@ Una vez instaladas las dependencias y colocados los datos:
 ```bash
 python Main.py
 ```
+
