@@ -25,7 +25,7 @@ def verificar_o_crear_mapa(carpeta_datos, nombre_salida):
 
     print(f"El archivo '{nombre_salida}' no existe. Iniciando generación...")
     
-    # Buscar archivos con extensión .hgt (minúsculas)
+    # Buscar archivos con extensión .hgt
     patron = os.path.join(carpeta_datos, "*.hgt")
     archivos_hgt = glob.glob(patron)
     
