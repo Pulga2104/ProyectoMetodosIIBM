@@ -2,6 +2,12 @@
 
 Este proyecto requiere ciertas dependencias y datos para funcionar correctamente. A continuación se detalla todo lo necesario.
 
+## Limitacion de provincias (Datos):
+
+El archivo GeoJSON lo obtuvimos del proyecto GADM, la descarga de estos datos es unicamente para fines academicos y no comerciales, donde descargamos unicamente el nivel 1, ya que este solo contiene los datos de las limitaciones por provincias.
+
+Link de GADM: https://gadm.org/download_country.html
+
 ## Provisión de Datos (Importante)
 
 **Uso de datos del repositorio**
